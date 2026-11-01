@@ -1,8 +1,14 @@
-// Golden Kog risk debate module.
-// Two advocates (sound / fragile) argue from measured facts, a reviewer weighs
-// them. A risk tool, never a trading tool. Adapted from the TradingAgents
-// debate pattern (TauricResearch, Apache 2.0) without its trader or portfolio
-// manager. No runtime dependency; Node 22.
+/**
+ * debate.ts — two-sided structure debate for token risk analysis (Golden Kog).
+ *
+ * A "sound" advocate and a "fragile" advocate each argue a token's structure
+ * from measured facts only; a reviewer weighs both and keeps the risk
+ * framing. This is a risk tool, never a trading tool: no buy/sell view,
+ * no price target, no entry/exit, no advice.
+ *
+ * Pattern adapted from TradingAgents (TauricResearch, Apache 2.0):
+ * https://github.com/TauricResearch/TradingAgents
+ */
 
 export interface DebateInput {
   facts_text: string;
@@ -34,10 +40,10 @@ export interface RouteResult {
 }
 
 export interface DebateDeps {
-  route(args: RouteArgs): Promise<RouteResult>;
-  check?(text: string): string[];
+  route: (args: RouteArgs) => Promise<RouteResult>;
+  check?: (text: string) => string[];
   mode?: 'off' | 'shadow' | 'on';
-  log?(row: object): void;
+  log?: (row: object) => void;
   timeoutMs?: number;
 }
 
@@ -55,257 +61,308 @@ export interface Debate {
   rejected: string[];
 }
 
-const REFUSED = [
+const FALLBACK = 'No case could be written from the measured facts.';
+const AGENT_ID = 'golden-kog' as const;
+const ADVOCATE_WORD_LIMIT = 180;
+const REVIEWER_WORD_LIMIT = 150;
+
+const FORBIDDEN_WORDS = [
   'bull', 'bear', 'bullish', 'bearish', 'upside', 'downside target',
   'undervalued', 'overvalued', 'accumulate', 'moon', 'buy now', 'sell now',
   'price target', 'entry', 'exit', 'take profit', 'not financial advice',
 ];
 
-const EMPTY_PART = 'No case could be written from the measured facts.';
+const LONG_DASHES = /[\u2013\u2014\u2015\u2212]/;
+const NON_LATIN_DIGIT = /[\p{Nd}\p{No}]/u; // checked after stripping ASCII digits
+const ASCII_NUMBER = /\d[\d.,]*\d|\d/g;
 
-const ADVOCATE_WORDS = 180;
-const REVIEWER_WORDS = 150;
+const SOUND_SYSTEM =
+  'You are the sound-structure advocate in a token risk debate. ' +
+  'Argue, from the measured facts only, why the token structure is sound. ' +
+  'Use only facts present in the facts block and only numbers written exactly as they appear there. ' +
+  'Never give a trading view: no direction call, no target, no entry or exit, no advice. ' +
+  'Write at most 180 words. Latin digits only, no long dashes.';
 
-function numbersOf(text: string): string[] {
-  return text.match(/\d+(?:[.,]\d+)*(?:%|x)?/gi) ?? [];
+const FRAGILE_SYSTEM =
+  'You are the fragile-structure advocate in a token risk debate. ' +
+  'Argue, from the measured facts only, why the token structure is fragile. ' +
+  'Use only facts present in the facts block and only numbers written exactly as they appear there. ' +
+  'Never give a trading view: no direction call, no target, no entry or exit, no advice. ' +
+  'Write at most 180 words. Latin digits only, no long dashes.';
+
+const REVIEWER_SYSTEM =
+  'You are the reviewer of a two-sided token structure debate. ' +
+  'Weigh the sound and fragile cases against the measured facts and write the risk reading. ' +
+  'Use only facts and numbers that appear in the facts block, written the same way. ' +
+  'Never give a trading view: no direction call, no target, no entry or exit, no advice. ' +
+  'Write at most 150 words. Latin digits only, no long dashes. ' +
+  'Answer with strict JSON only: {"text": string, "weight": string[], "unknown": string[], "tension"?: string}. ' +
+  'weight holds only risk flag ids from the given list; unknown holds open questions.';
+
+function countWords(text: string): number {
+  return text.split(/\s+/).filter((w) => w.length > 0).length;
 }
 
-function wordCount(text: string): number {
-  return text.trim().split(/\s+/).filter(Boolean).length;
-}
-
-function hasNonLatinDigit(text: string): boolean {
-  return /[\u0660-\u0669\u06F0-\u06F9\u0966-\u096F\u09E6-\u09EF\u0A66-\u0A6F\u0AE6-\u0AEF\u0B66-\u0B6F\u0BE6-\u0BEF\u0C66-\u0C6F\u0CE6-\u0CEF\u0D66-\u0D6F\u0DE6-\u0DEF\u0E50-\u0E59\u0ED0-\u0ED9\u1040-\u1049\u17E0-\u17E9\uFF10-\uFF19]/.test(text);
-}
-
-function hasDash(text: string): boolean {
-  return /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/.test(text);
-}
-
-function refusedWord(text: string): string | null {
-  const low = text.toLowerCase();
-  for (const w of REFUSED) {
-    const re = new RegExp(`\\b${w.replace(/ /g, '\\s+')}\\b`, 'i');
-    if (re.test(low)) return w;
-  }
-  return null;
+function approxTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 function validatePart(
   text: string,
-  facts_text: string,
-  maxWords: number,
-  check: ((t: string) => string[]) | undefined,
+  factsText: string,
+  wordLimit: number,
+  check?: (t: string) => string[],
 ): string[] {
-  const problems: string[] = [];
-  for (const n of numbersOf(text)) {
-    if (!facts_text.includes(n)) problems.push(`number not in facts: ${n}`);
+  const reasons: string[] = [];
+
+  for (const m of text.match(ASCII_NUMBER) ?? []) {
+    const num = m.replace(/^[.,]+|[.,]+$/g, '');
+    if (num.length > 0 && !factsText.includes(num)) {
+      reasons.push(`number not in facts_text: ${num}`);
+    }
   }
-  const bad = refusedWord(text);
-  if (bad) problems.push(`refused word: ${bad}`);
-  if (hasDash(text)) problems.push('dash character present');
-  if (hasNonLatinDigit(text)) problems.push('non-Latin digit present');
-  if (wordCount(text) > maxWords) problems.push(`over ${maxWords} words`);
+
+  const lower = text.toLowerCase();
+  for (const w of FORBIDDEN_WORDS) {
+    const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    if (re.test(lower)) reasons.push(`refused term: ${w}`);
+  }
+
+  if (LONG_DASHES.test(text)) reasons.push('long dash character');
+  if (NON_LATIN_DIGIT.test(text.replace(/[0-9]/g, ''))) reasons.push('non Latin digit');
+  if (countWords(text) > wordLimit) {
+    reasons.push(`over ${wordLimit} words (${countWords(text)})`);
+  }
+
   if (check) {
-    for (const p of check(text) ?? []) problems.push(p);
+    for (const p of check(text) ?? []) reasons.push(`deps.check: ${p}`);
   }
-  return problems;
+  return reasons;
 }
 
-function systemFor(role: 'sound' | 'fragile' | 'reviewer'): string {
-  const base =
-    'You are part of a structured risk debate for a token risk report. ' +
-    'This is a risk tool, never a trading tool: argue only from the measured ' +
-    'facts given. Every number you write must appear in the facts, written ' +
-    'the same way. Never use trading language (no buy, sell, price target, ' +
-    'entry, exit or advice). Latin digits only, no dash characters. ';
-  if (role === 'sound') {
-    return base + 'You argue the token structure is SOUND: cite the measured ' +
-      'facts that support structural strength, acknowledge gaps honestly. ' +
-      'At most 180 words.';
+class TimeoutError extends Error {
+  constructor() {
+    super('route call exceeded timeoutMs');
   }
-  if (role === 'fragile') {
-    return base + 'You argue the token structure is FRAGILE: cite the measured ' +
-      'facts and fired risk rules that support structural weakness. ' +
-      'At most 180 words.';
-  }
-  return base + 'You are the REVIEWER. Weigh the sound and fragile cases ' +
-    'against the facts and answer ONLY JSON of the form ' +
-    '{"text": string, "weight": string[], "unknown": string[], ' +
-    '"tension": string}. weight holds ids from the fired risk rules that ' +
-    'carry the decision. At most 150 words total.';
 }
 
-function promptFor(
-  role: 'sound' | 'fragile' | 'reviewer',
-  input: DebateInput,
-  sound: string,
-  fragile: string,
-): string {
-  const head =
-    `Measured facts:\n${input.facts_text}\n\n` +
-    `Fired risk rule ids: ${input.flag_ids.join(', ') || 'none'}\n` +
-    `Known unknowns: ${input.unknown.join(', ') || 'none'}\n\n`;
-  if (role === 'sound') {
-    return head + 'Write the sound-structure case from these facts only.';
-  }
-  if (role === 'fragile') {
-    return head + 'Write the fragile-structure case from these facts only.';
-  }
-  return head +
-    `Sound case:\n${sound}\n\nFragile case:\n${fragile}\n\n` +
-    'Weigh both. JSON only.';
-}
-
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
-async function callWithTimeout(
-  deps: DebateDeps,
-  args: RouteArgs,
-  timeoutMs: number,
-): Promise<RouteResult | 'timeout'> {
-  const call = deps.route(args);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<'timeout'>((resolve) => {
-    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new TimeoutError()), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
   });
+}
+
+function routeCall(
+  deps: DebateDeps,
+  role: 'sound' | 'fragile' | 'reviewer',
+  system: string,
+  prompt: string,
+  maxTokens: number,
+): Promise<RouteResult> {
+  return deps.route({
+    task_type: 'risk_debate',
+    tier_class: 'text',
+    complexity: role === 'reviewer' ? 'apex' : 'exec',
+    context_tokens: approxTokens(system + prompt),
+    constitutional_flag: false,
+    agent_id: AGENT_ID,
+    payload: { role, system, prompt, max_tokens: maxTokens },
+  });
+}
+
+interface ReviewerOut {
+  text: string;
+  weight: string[];
+  unknown: string[];
+  tension?: string;
+}
+
+function parseReviewer(content: string): ReviewerOut | null {
+  let s = content.trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) s = fence[1].trim();
+  const brace = s.indexOf('{');
+  if (brace === -1) return null;
+  const end = s.lastIndexOf('}');
+  if (end <= brace) return null;
   try {
-    const result = await Promise.race([call, timeout]);
-    return result;
-  } finally {
-    if (timer) clearTimeout(timer);
+    const o = JSON.parse(s.slice(brace, end + 1));
+    if (typeof o !== 'object' || o === null) return null;
+    if (typeof o.text !== 'string' || o.text.trim().length === 0) return null;
+    return {
+      text: o.text,
+      weight: Array.isArray(o.weight) ? o.weight.filter((x: unknown) => typeof x === 'string') : [],
+      unknown: Array.isArray(o.unknown) ? o.unknown.filter((x: unknown) => typeof x === 'string') : [],
+      tension: typeof o.tension === 'string' ? o.tension : undefined,
+    };
+  } catch {
+    return null;
   }
 }
 
-function emptyDebate(status: Debate['status'], shown: boolean): Debate {
+function emptyDebate(status: Debate['status'], rejected: string[]): Debate {
   return {
-    status, shown, sound: '', fragile: '', reviewer: '',
-    weight: [], unknown: [], models: {}, usd: 0, rejected: [],
+    status,
+    shown: false,
+    sound: '',
+    fragile: '',
+    reviewer: '',
+    weight: [],
+    unknown: [],
+    models: {},
+    usd: 0,
+    rejected,
   };
 }
 
 export async function debate(input: DebateInput, deps: DebateDeps): Promise<Debate> {
   const mode = deps.mode ?? 'shadow';
-  if (mode === 'off') return emptyDebate('off', false);
+  const timeoutMs = deps.timeoutMs ?? 45000;
+  const rejected: string[] = [];
+
+  if (mode === 'off') {
+    const d = emptyDebate('off', rejected);
+    d.unknown = [...input.unknown];
+    return d;
+  }
 
   const shown = mode === 'on';
-  const timeoutMs = deps.timeoutMs ?? 45000;
-  const check = deps.check;
-  const out = emptyDebate('ok', shown);
-  const flagSet = new Set(input.flag_ids);
+  const models: Debate['models'] = {};
+  let usd = 0;
+
+  const advocatePrompt = (side: 'sound' | 'fragile') =>
+    `Facts:\n${input.facts_text}\n\n` +
+    `Risk flags that fired: ${input.flag_ids.join(', ') || 'none'}.\n` +
+    `Open unknowns: ${input.unknown.join(', ') || 'none'}.\n` +
+    `Argue the ${side} case for the token structure, from the measured facts only.`;
 
   // Advocates run in parallel.
-  const mkArgs = (role: 'sound' | 'fragile'): RouteArgs => {
-    const system = systemFor(role);
-    const prompt = promptFor(role, input, '', '');
-    return {
-      task_type: 'risk_debate',
-      tier_class: 'text',
-      complexity: 'exec',
-      context_tokens: estimateTokens(system + prompt),
-      constitutional_flag: false,
-      agent_id: 'golden-kog',
-      payload: { role, system, prompt, max_tokens: 400 },
-    };
-  };
+  let soundRes: RouteResult | undefined;
+  let fragileRes: RouteResult | undefined;
+  let anyTimeout = false;
 
-  const [soundRes, fragileRes] = await Promise.all([
-    callWithTimeout(deps, mkArgs('sound'), timeoutMs),
-    callWithTimeout(deps, mkArgs('fragile'), timeoutMs),
+  const settled = await Promise.allSettled([
+    withTimeout(routeCall(deps, 'sound', SOUND_SYSTEM, advocatePrompt('sound'), 400), timeoutMs),
+    withTimeout(routeCall(deps, 'fragile', FRAGILE_SYSTEM, advocatePrompt('fragile'), 400), timeoutMs),
   ]);
 
-  const parts: { role: 'sound' | 'fragile'; res: RouteResult | 'timeout' }[] = [
-    { role: 'sound', res: soundRes },
-    { role: 'fragile', res: fragileRes },
-  ];
-  for (const { role, res } of parts) {
-    if (res === 'timeout') {
-      out.status = 'timeout';
-      out.rejected.push(`${role} call timed out`);
-      continue;
-    }
-    if (res.model) out.models[role] = res.model;
-    out.usd += res.cost_usd ?? 0;
-    const problems = validatePart(res.content, input.facts_text, ADVOCATE_WORDS, check);
-    if (problems.length) {
-      out[role] = EMPTY_PART;
-      out.rejected.push(...problems.map((p) => `${role}: ${p}`));
+  for (let i = 0; i < 2; i++) {
+    const r = settled[i];
+    const role = i === 0 ? 'sound' : 'fragile';
+    if (r.status === 'fulfilled') {
+      if (i === 0) soundRes = r.value; else fragileRes = r.value;
+      usd += r.value.cost_usd ?? 0;
+      if (r.value.model) models[role] = r.value.model;
+    } else if (r.reason instanceof TimeoutError) {
+      anyTimeout = true;
+      rejected.push(`${role} call timeout`);
     } else {
-      out[role] = res.content;
-    }
-  }
-  if (out.status === 'timeout') {
-    out.shown = mode === 'on';
-    deps.log?.(out);
-    return out;
-  }
-
-  // Reviewer gets both texts and the facts.
-  {
-    const system = systemFor('reviewer');
-    const prompt = promptFor('reviewer', input, out.sound, out.fragile);
-    const args: RouteArgs = {
-      task_type: 'risk_debate',
-      tier_class: 'text',
-      complexity: 'apex',
-      context_tokens: estimateTokens(system + prompt),
-      constitutional_flag: false,
-      agent_id: 'golden-kog',
-      payload: { role: 'reviewer', system, prompt, max_tokens: 400 },
-    };
-    const res = await callWithTimeout(deps, args, timeoutMs);
-    if (res === 'timeout') {
-      out.status = 'timeout';
-      out.rejected.push('reviewer call timed out');
-      out.shown = mode === 'on';
-      deps.log?.(out);
-      return out;
-    }
-    if (res.model) out.models.reviewer = res.model;
-    out.usd += res.cost_usd ?? 0;
-
-    let parsed: { text?: unknown; weight?: unknown; unknown?: unknown; tension?: unknown };
-    try {
-      const m = res.content.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(m ? m[0] : res.content);
-    } catch {
-      out.status = 'rejected';
-      out.sound = '';
-      out.fragile = '';
-      out.rejected.push('reviewer JSON unparseable');
-      out.shown = mode === 'on';
-      deps.log?.(out);
-      return out;
-    }
-
-    const text = typeof parsed.text === 'string' ? parsed.text : '';
-    const problems = validatePart(text, input.facts_text, REVIEWER_WORDS, check);
-    if (!text || problems.length) {
-      out.status = 'rejected';
-      out.sound = '';
-      out.fragile = '';
-      out.reviewer = '';
-      out.rejected.push(
-        ...(text ? problems : ['reviewer text missing']).map((p) => `reviewer: ${p}`),
-      );
-      out.shown = mode === 'on';
-      deps.log?.(out);
-      return out;
-    }
-
-    out.reviewer = text;
-    out.weight = (Array.isArray(parsed.weight) ? parsed.weight : [])
-      .filter((w): w is string => typeof w === 'string')
-      .filter((w) => flagSet.has(w));
-    out.unknown = (Array.isArray(parsed.unknown) ? parsed.unknown : [])
-      .filter((u): u is string => typeof u === 'string');
-    if (typeof parsed.tension === 'string' && parsed.tension) {
-      out.tension = parsed.tension;
+      rejected.push(`${role} call failed: ${String(r.reason).slice(0, 160)}`);
     }
   }
 
-  deps.log?.(out);
-  return out;
+  if (anyTimeout) {
+    const d = emptyDebate('timeout', rejected);
+    d.usd = usd;
+    d.models = models;
+    d.unknown = [...input.unknown];
+    if (mode === 'shadow') deps.log?.(d);
+    d.shown = shown;
+    return d;
+  }
+
+  const sound = soundRes?.content ?? '';
+  const fragile = fragileRes?.content ?? '';
+
+  const finalSound = soundRes === undefined
+    ? FALLBACK
+    : (() => {
+        const rs = validatePart(sound, input.facts_text, ADVOCATE_WORD_LIMIT, deps.check);
+        rs.forEach((x) => rejected.push(`sound: ${x}`));
+        return rs.length ? FALLBACK : sound;
+      })();
+
+  const finalFragile = fragileRes === undefined
+    ? FALLBACK
+    : (() => {
+        const rs = validatePart(fragile, input.facts_text, ADVOCATE_WORD_LIMIT, deps.check);
+        rs.forEach((x) => rejected.push(`fragile: ${x}`));
+        return rs.length ? FALLBACK : fragile;
+      })();
+
+  // Reviewer sees both advocate texts and the facts.
+  const reviewerPrompt =
+    `Facts:\n${input.facts_text}\n\n` +
+    `Risk flags that fired: ${input.flag_ids.join(', ') || 'none'}.\n\n` +
+    `Sound case:\n${finalSound}\n\nFragile case:\n${finalFragile}\n\n` +
+    'Weigh the two cases and answer with the strict JSON only.';
+
+  let reviewerRes: RouteResult | undefined;
+  try {
+    reviewerRes = await withTimeout(
+      routeCall(deps, 'reviewer', REVIEWER_SYSTEM, reviewerPrompt, 500),
+      timeoutMs,
+    );
+    usd += reviewerRes.cost_usd ?? 0;
+    if (reviewerRes.model) models.reviewer = reviewerRes.model;
+  } catch (e) {
+    if (e instanceof TimeoutError) {
+      const d = emptyDebate('timeout', [...rejected, 'reviewer call timeout']);
+      d.usd = usd; d.models = models; d.unknown = [...input.unknown];
+      if (mode === 'shadow') deps.log?.(d);
+      d.shown = shown;
+      return d;
+    }
+    rejected.push(`reviewer call failed: ${String(e).slice(0, 160)}`);
+  }
+
+  if (reviewerRes === undefined) {
+    const d = emptyDebate('rejected', rejected);
+    d.usd = usd; d.models = models; d.unknown = [...input.unknown];
+    if (mode === 'shadow') deps.log?.(d);
+    d.shown = shown;
+    return d;
+  }
+
+  const parsed = parseReviewer(reviewerRes.content);
+  if (!parsed) {
+    const d = emptyDebate('rejected', [...rejected, 'reviewer output unparseable']);
+    d.usd = usd; d.models = models; d.unknown = [...input.unknown];
+    if (mode === 'shadow') deps.log?.(d);
+    d.shown = shown;
+    return d;
+  }
+
+  const rReasons = validatePart(parsed.text, input.facts_text, REVIEWER_WORD_LIMIT, deps.check);
+  if (rReasons.length) {
+    const d = emptyDebate('rejected', [...rejected, ...rReasons.map((x) => `reviewer: ${x}`)]);
+    d.usd = usd; d.models = models; d.unknown = [...input.unknown];
+    if (mode === 'shadow') deps.log?.(d);
+    d.shown = shown;
+    return d;
+  }
+
+  const knownFlags = new Set(input.flag_ids);
+  const weight = parsed.weight.filter((id) => knownFlags.has(id));
+  const unknown = [...new Set([...input.unknown, ...parsed.unknown])];
+
+  const d: Debate = {
+    status: 'ok',
+    shown,
+    sound: finalSound,
+    fragile: finalFragile,
+    reviewer: parsed.text,
+    weight,
+    unknown,
+    tension: parsed.tension,
+    models,
+    usd,
+    rejected,
+  };
+  if (mode === 'shadow') deps.log?.(d);
+  return d;
 }
